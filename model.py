@@ -1,239 +1,300 @@
-
+from __future__ import division
+import os
+import time
+from glob import glob
 import tensorflow as tf
-import tensorlayer as tl
-from tensorlayer.layers import *
+import numpy as np
+from six.moves import xrange
+from collections import namedtuple
 
+from module import *
+from utils import *
 
-flags = tf.app.flags
-FLAGS = flags.FLAGS
+class cyclegan(object):
+    def __init__(self, sess, args):
+        self.sess = sess
+        self.batch_size = args.batch_size
+        self.image_size = args.fine_size
 
-def generator_simplified_api(inputs, is_train=True, reuse=False):
-    image_size = 64
-    s2, s4, s8, s16 = int(image_size/2), int(image_size/4), int(image_size/8), int(image_size/16)
-    gf_dim = 64 # Dimension of gen filters in first conv layer. [64]
-    c_dim = FLAGS.c_dim # n_color 3
-    batch_size = FLAGS.batch_size # 64
+        self.c_dim = args.input_nc
+        self.z_dim = args.input_nz
 
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    gamma_init = tf.random_normal_initializer(1., 0.02)
+        self.L1_lambda = args.L1_lambda
+        self.dataset_dir = args.dataset_dir
 
-    with tf.variable_scope("generator", reuse=reuse):
-        tl.layers.set_name_reuse(reuse)
+        self.discA = discA
+        self.discB = discB
+        self.discAB = discAB
+        self.encoder = encoder
+        self.decoder = decoder
 
-        net_in = InputLayer(inputs, name='g/in')
-        net_h0 = DenseLayer(net_in, n_units=gf_dim*8*s16*s16, W_init=w_init,
-                act = tf.identity, name='g/h0/lin')
-        net_h0 = ReshapeLayer(net_h0, shape=[-1, s16, s16, gf_dim*8], name='g/h0/reshape')
-        net_h0 = BatchNormLayer(net_h0, act=tf.nn.relu, is_train=is_train,
-                gamma_init=gamma_init, name='g/h0/batch_norm')
+        self.encoder = encoder_unet
+        self.decoder = decoder_unet
 
-        net_h1 = DeConv2d(net_h0, gf_dim*4, (5, 5), out_size=(s8, s8), strides=(2, 2),
-                padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='g/h1/decon2d')
-        net_h1 = BatchNormLayer(net_h1, act=tf.nn.relu, is_train=is_train,
-                gamma_init=gamma_init, name='g/h1/batch_norm')
+        if args.use_lsgan:
+            self.criterionGAN = mae_criterion
+        else:
+            self.criterionGAN = sce_criterion
 
-        net_h2 = DeConv2d(net_h1, gf_dim*2, (5, 5), out_size=(s4, s4), strides=(2, 2),
-                padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='g/h2/decon2d')
-        net_h2 = BatchNormLayer(net_h2, act=tf.nn.relu, is_train=is_train,
-                gamma_init=gamma_init, name='g/h2/batch_norm')
+        OPTIONS = namedtuple('OPTIONS', 'batch_size image_size \
+                              gf_dim df_dim output_c_dim')
 
-        net_h3 = DeConv2d(net_h2, gf_dim, (5, 5), out_size=(s2, s2), strides=(2, 2),
-                padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='g/h3/decon2d')
-        net_h3 = BatchNormLayer(net_h3, act=tf.nn.relu, is_train=is_train,
-                gamma_init=gamma_init, name='g/h3/batch_norm')
+        self.options = OPTIONS._make((args.batch_size, args.fine_size,
+                                      args.ngf, args.ndf, args.output_nc))
 
-        net_h4 = DeConv2d(net_h3, c_dim, (5, 5), out_size=(image_size, image_size), strides=(2, 2),
-                padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='g/h4/decon2d')
-        logits = net_h4.outputs
-        net_h4.outputs = tf.nn.tanh(net_h4.outputs)
-    return net_h4, logits
+        self._build_model()
+        self.saver = tf.train.Saver()
+        self.pool = ImagePool(args.max_size)
 
-def discriminator_simplified_api(inputs, is_train=True, reuse=False, use_sigmoid=True):
-    df_dim = 64 # Dimension of discrim filters in first conv layer. [64]
-    c_dim = FLAGS.c_dim # n_color 3
-    batch_size = FLAGS.batch_size # 64
+    def _build_model(self):
+        # Here, we set A as the image and B is the latent code
+        self.real_A = tf.placeholder(tf.float32,
+                                        [None, self.image_size, self.image_size, 
+                                         self.c_dim],
+                                        name='real_image')
+        self.real_B = tf.placeholder(tf.float32, 
+                                        [None, self.z_dim],
+                                        name='real_code')
 
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    gamma_init = tf.random_normal_initializer(1., 0.02)
+        self.fake_B  = self.encoder(self.real_A, self.options, False, name='encoder')
+        self.fake_A_ = self.decoder(self.fake_B, self.options, False, name='decoder')
 
-    with tf.variable_scope("discriminator", reuse=reuse):
-        tl.layers.set_name_reuse(reuse)
+        self.fake_A  = self.decoder(self.real_B, self.options, True,  name='decoder')
+        self.fake_B_ = self.decoder(self.fake_A, self.options, True,  name='encoder')
 
-        net_in = InputLayer(inputs, name='d/in')
-        net_h0 = Conv2d(net_in, df_dim, (5, 5), (2, 2), act=lambda x: tl.act.lrelu(x, 0.2),
-                        padding='SAME', W_init=w_init, name='d/h0/conv2d')
+        self.DB_fake = self.discB(self.fake_B, self.options, reuse=False, name="discriminatorB")
+        self.DA_fake = self.discA(self.fake_A, self.options, reuse=False, name="discriminatorA")
 
-        net_h1 = Conv2d(net_h0, df_dim*2, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='d/h1/conv2d')
-        net_h1 = BatchNormLayer(net_h1, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='d/h1/batch_norm')
+        self.DA2B    = self.discAB(self.real_A, self.fake_B, self.options, reuse=False, name="discriminatorAB")
+        self.DB2A    = self.discAB(self.fake_A, self.real_B, self.options, reuse=True,  name="discriminatorAB")
 
-        net_h2 = Conv2d(net_h1, df_dim*4, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='d/h2/conv2d')
-        net_h2 = BatchNormLayer(net_h2, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='d/h2/batch_norm')
+        self.g_loss_a2b = self.criterionGAN(self.DB_fake, tf.ones_like(self.DB_fake)) \
+                          + self.criterionGAN(self.DA2B, tf.ones_like(self.DA2B)) \
+                          + self.L1_lambda * abs_criterion(self.real_A, self.fake_A_) \
+                          + self.L1_lambda * abs_criterion(self.real_B, self.fake_B_)
 
-        net_h3 = Conv2d(net_h2, df_dim*8, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='d/h3/conv2d')
-        net_h3 = BatchNormLayer(net_h3, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='d/h3/batch_norm')
+        self.g_loss_b2a = self.criterionGAN(self.DA_fake, tf.ones_like(self.DA_fake)) \
+                          + self.criterionGAN(self.DB2A, tf.ones_like(self.DB2A)) \
+                          + self.L1_lambda * abs_criterion(self.real_A, self.fake_A_) \
+                          + self.L1_lambda * abs_criterion(self.real_B, self.fake_B_)
 
-        net_h4 = FlattenLayer(net_h3, name='d/h4/flatten')
-        net_h4 = DenseLayer(net_h4, n_units=1, act=tf.identity,
-                            W_init = w_init, name='d/h4/lin_sigmoid')
-        logits = net_h4.outputs
-        if use_sigmoid:
-            net_h4.outputs = tf.nn.sigmoid(net_h4.outputs)
+        # The reason for use fake_*_sample is to just update the discriminator, not the encoder/decoder
+        self.fake_A_sample = tf.placeholder(tf.float32,
+                                            [None, self.image_size, self.image_size,
+                                             self.input_c_dim], name='fake_A_sample')
+        self.fake_B_sample = tf.placeholder(tf.float32,
+                                            [None, self.image_size, self.image_size,
+                                             self.output_c_dim], name='fake_B_sample')
 
-    return net_h4, logits
+        self.DB_real = self.discB(self.real_B, self.options, reuse=True, name="discriminatorB")
+        self.DA_real = self.discA(self.real_A, self.options, reuse=True, name="discriminatorA")
+        self.DB_fake_sample = self.discB(self.fake_B_sample, self.options, reuse=True, name="discriminatorB")
+        self.DA_fake_sample = self.discA(self.fake_A_sample, self.options, reuse=True, name="discriminatorA")
+        self.db_loss_real = self.criterionGAN(self.DB_real, tf.ones_like(self.DB_real))
+        self.db_loss_fake = self.criterionGAN(self.DB_fake_sample, tf.zeros_like(self.DB_fake_sample))
+        self.db_loss = (self.db_loss_real + self.db_loss_fake) / 2
+        self.da_loss_real = self.criterionGAN(self.DA_real, tf.ones_like(self.DA_real))
+        self.da_loss_fake = self.criterionGAN(self.DA_fake_sample, tf.zeros_like(self.DA_fake_sample))
+        self.da_loss = (self.da_loss_real + self.da_loss_fake) / 2
 
-
-def decoder_simplified_api(inputs, is_train=True, reuse=False):
-    image_size = 64
-    s2, s4, s8, s16 = int(image_size/2), int(image_size/4), int(image_size/8), int(image_size/16)
-    gf_dim = 64 # Dimension of gen filters in first conv layer. [64]
-    c_dim = 3 # n_color 3
-    batch_size = FLAGS.batch_size # 64
-
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    gamma_init = tf.random_normal_initializer(1., 0.02)
-
-    with tf.variable_scope("DECODER", reuse=reuse):
-        tl.layers.set_name_reuse(reuse)
-
-        net_in = InputLayer(inputs, name='De/in')
-        net_h0 = DenseLayer(net_in, n_units=gf_dim*8*s16*s16, W_init=w_init,
-                            act = tf.identity, name='De/h0/lin')
-        net_h0 = ReshapeLayer(net_h0, shape=[-1, s16, s16, gf_dim*8], name='De/h0/reshape')
-        net_h0 = BatchNormLayer(net_h0, act=tf.nn.relu, is_train=is_train,
-                                gamma_init=gamma_init, name='De/h0/batch_norm')
-
-        net_h1 = DeConv2d(net_h0, gf_dim*4, (5, 5), out_size=(s8, s8), strides=(2, 2),
-                          padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='De/h1/decon2d')
-        net_h1 = BatchNormLayer(net_h1, act=tf.nn.relu, is_train=is_train,
-                                gamma_init=gamma_init, name='De/h1/batch_norm')
-
-        net_h2 = DeConv2d(net_h1, gf_dim*2, (5, 5), out_size=(s4, s4), strides=(2, 2),
-                          padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='De/h2/decon2d')
-        net_h2 = BatchNormLayer(net_h2, act=tf.nn.relu, is_train=is_train,
-                                gamma_init=gamma_init, name='De/h2/batch_norm')
-
-        net_h3 = DeConv2d(net_h2, gf_dim, (5, 5), out_size=(s2, s2), strides=(2, 2),
-                          padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='De/h3/decon2d')
-        net_h3 = BatchNormLayer(net_h3, act=tf.nn.relu, is_train=is_train,
-                                gamma_init=gamma_init, name='De/h3/batch_norm')
-
-        net_h4 = DeConv2d(net_h3, c_dim, (5, 5), out_size=(image_size, image_size), strides=(2, 2),
-                          padding='SAME', batch_size=batch_size, act=None, W_init=w_init, name='De/h4/decon2d')
-        logits = net_h4.outputs
-        net_h4.outputs = tf.nn.tanh(net_h4.outputs)
-
-    return net_h4, logits
-
-
-def encoder_simplified_api(inputs, is_train=True, reuse=False):
-    df_dim = 64 # Dimension of discrim filters in first conv layer. [64]
-    z_dim = 512
-
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    gamma_init = tf.random_normal_initializer(1., 0.02)
-
-    with tf.variable_scope("ENCODER", reuse=reuse):
-        tl.layers.set_name_reuse(reuse)
-
-        net_in = InputLayer(inputs, name='En/in')
-        net_h0 = Conv2d(net_in, df_dim, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='En/h0/conv2d')
-        net_h0 = BatchNormLayer(net_h0, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='En/h0/batch_norm')
-
-        net_h1 = Conv2d(net_h0, df_dim*2, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='En/h1/conv2d')
-        net_h1 = BatchNormLayer(net_h1, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='En/h1/batch_norm')
-
-        net_h2 = Conv2d(net_h1, df_dim*4, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='En/h2/conv2d')
-        net_h2 = BatchNormLayer(net_h2, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='En/h2/batch_norm')
-
-        net_h3 = Conv2d(net_h2, df_dim*8, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='En/h3/conv2d')
-        net_h3 = BatchNormLayer(net_h3, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='En/h3/batch_norm')
-
-        net_h4 = FlattenLayer(net_h3, name='En/h4/flatten')
-        net_h4 = DenseLayer(net_h4, n_units=z_dim, act=tf.identity,
-                            W_init = w_init, name='En/h4/lin_sigmoid')
-        logits = net_h4.outputs
-
-    return net_h4, logits
-
-def discriminator_ali_api(input_X, input_Z, is_train=True, reuse=False):
-    
-    ## under CelebA Parameters
-    df_dim = 2048
-    dX_dim = 64
-    dX_out = 1024
-    dZ_out = 1024
-    dZ_dim = 512
-    c_dim = FLAGS.c_dim # n_color 3
-    batch_size = FLAGS.batch_size # 64
-
-    w_init = tf.random_normal_initializer(stddev=0.02)
-    gamma_init = tf.random_normal_initializer(1., 0.02)    
-
-    with tf.variable_scope("DISCRIMINATOR", reuse=reuse):
-        tl.layers.set_name_reuse(reuse)
-
-        ## For Image
-        netX_in = InputLayer(input_X, name='DX/in')
-        netX_h0 = Conv2d(netX_in, dX_dim, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='DX/h0/conv2d')
-        netX_h0 = BatchNormLayer(netX_h0, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='DX/h0/batch_norm')
-
-        netX_h1 = Conv2d(netX_h0, dX_dim*2, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='DX/h1/conv2d')
-        netX_h1 = BatchNormLayer(netX_h1, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='DX/h1/batch_norm')
-
-        netX_h2 = Conv2d(netX_h1, dX_dim*4, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='DX/h2/conv2d')
-        netX_h2 = BatchNormLayer(netX_h2, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='DX/h2/batch_norm')
-
-        netX_h3 = Conv2d(netX_h2, dX_dim*8, (5, 5), (2, 2), act=None,
-                        padding='SAME', W_init=w_init, name='DX/h3/conv2d')
-        netX_h3 = BatchNormLayer(netX_h3, act=lambda x: tl.act.lrelu(x, 0.2),
-                                is_train=is_train, gamma_init=gamma_init, name='DX/h3/batch_norm')
-
-        netX_h4 = FlattenLayer(netX_h3, name='DX/h4/flatten')
-        netX_h4 = DenseLayer(netX_h4, n_units=dX_out, act=tf.identity,
-                            W_init = w_init, name='DX/h4/lin_sigmoid')
-        netX_h4 = BatchNormLayer(netX_h4, act=lambda x: tl.act.lrelu(x, 0.2),
-                                 is_train=is_train, gamma_init=gamma_init, name='DX/h4/batch_norm')
-
-        ## For Code
-        netZ_in = InputLayer(input_Z, name='DZ/in')
-        netZ_h0 = DropoutLayer(netZ_in, keep=0.8, name='DZ/h0/drop')
-        netZ_h0 = DenseLayer(netZ_h0, n_units=dZ_dim, act=tf.identity,
-                             W_init = w_init, name='DZ/h0/fcn')
-        netZ_h1 = DropoutLayer(netZ_h0, keep=0.8, name='DZ/h1/drop')
-        netZ_h1 = DenseLayer(netZ_h1, n_units=dZ_out, act=tf.identity, 
-                             W_init = w_init, name='DZ/h1/fcn')
+        self.DA2B_fake_sample = self.discAB(self.real_A,        self.fake_B_sample, self.options, reuse=True, name="discriminatorAB")
+        self.DB2A_fake_sample = self.discAB(self.fake_A_sample, self.real_B,        self.options, reuse=True, name="discriminatorAB")
         
-        ## For Joint (Image, Code)
-        net_in = ConcatLayer(layer=[netX_h4, netZ_h1], name='DIS/in')
-        net_h0 = DropoutLayer(net_in, keep=0.8, name='DIS/h0/drop')
-        net_h0 = DenseLayer(net_h0, n_units=df_dim, act=lambda x: tl.act.lrelu(x, 0.2),
-                            W_init = w_init, name='DIS/h0/fcn')
-        net_h1 = DropoutLayer(net_h0, keep=0.8, name='DIS/h1/drop')
-        net_h1 = DenseLayer(net_h1, n_units=df_dim, act=lambda x: tl.act.lrelu(x, 0.2),
-                            W_init = w_init, name='DIS/h1/fcn')
-        net_h2 = DropoutLayer(net_h1, keep=0.8, name='DIS/h2/drop')
-        net_h2 = DenseLayer(net_h2, n_units=1,  act=lambda x: tl.act.lrelu(x, 0.2),
-                            W_init = w_init, name='DIS/h2/fcn')
-        logits = net_h2.outputs
+        self.da2b_loss    = self.criterionGAN(self.DA2B, tf.ones_like(self.DA2B))
+        self.db2a_loss    = self.criterionGAN(self.DB2A, tf.zeros_like(self.DB2A))
+        self.dab_loss     = (self.da2b_loss + self.db2a_loss)/2
 
-    return net_h2, logits
+        self.g_a2b_sum = tf.summary.scalar("g_loss_a2b", self.g_loss_a2b)
+        self.g_b2a_sum = tf.summary.scalar("g_loss_b2a", self.g_loss_b2a)
+        self.db_loss_sum = tf.summary.scalar("db_loss", self.db_loss)
+        self.da_loss_sum = tf.summary.scalar("da_loss", self.da_loss)
+        self.db_loss_real_sum = tf.summary.scalar("db_loss_real", self.db_loss_real)
+        self.db_loss_fake_sum = tf.summary.scalar("db_loss_fake", self.db_loss_fake)
+        self.da_loss_real_sum = tf.summary.scalar("da_loss_real", self.da_loss_real)
+        self.da_loss_fake_sum = tf.summary.scalar("da_loss_fake", self.da_loss_fake)
+
+        self.da2b_loss_sum = tf.summary.scalar("da2b_loss", self.da2b_loss)
+        self.db2a_loss_sum = tf.summary.scalar("db2a_loss", self.db2a_loss)
+        self.dab_loss_sum  = tf.summary.scalar("dab_loss", self.dab_loss)
+        
+        self.db_sum = tf.summary.merge(
+            [self.db_loss_sum, self.db_loss_real_sum, self.db_loss_fake_sum]
+        )
+        self.da_sum = tf.summary.merge(
+            [self.da_loss_sum, self.da_loss_real_sum, self.da_loss_fake_sum]
+        )
+        self.dab_sum = tf.summary.merge(
+            [self.da2b_loss_sum, self.db2a_loss_sum, self.dab_loss_sum]
+        )
+
+        self.test_A = tf.placeholder(tf.float32,
+                                     [None, self.image_size, self.image_size,
+                                      self.input_c_dim], name='test_A')
+        self.test_B = tf.placeholder(tf.float32,
+                                     [None, self.image_size, self.image_size,
+                                      self.output_c_dim], name='test_B')
+        self.testB = self.generator(self.test_A, self.options, True, name="generatorA2B")
+        self.testA = self.generator(self.test_B, self.options, True, name="generatorB2A")
+
+        t_vars = tf.trainable_variables()
+        self.db_vars = [var for var in t_vars if 'discriminatorB' in var.name]
+        self.da_vars = [var for var in t_vars if 'discriminatorA' in var.name]
+        self.dab_vars = [var for var in t_vars if 'discriminatorAB' in var.name]
+        self.g_vars_a2b = [var for var in t_vars if 'generatorA2B' in var.name]
+        self.g_vars_b2a = [var for var in t_vars if 'generatorB2A' in var.name]
+        for var in t_vars: print var.name
+
+    def train(self, args):
+        """Train cyclegan"""
+        self.da_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                                .minimize(self.da_loss, var_list=self.da_vars)
+        self.db_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                                .minimize(self.db_loss, var_list=self.db_vars)
+        self.dab_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                                .minimize(self.dab_loss, var_list=self.dab_vars)
+        self.g_a2b_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                                .minimize(self.g_loss_a2b, var_list=self.g_vars_a2b)
+        self.g_b2a_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                                .minimize(self.g_loss_b2a, var_list=self.g_vars_b2a)
+
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
+        self.writer = tf.summary.FileWriter("./logs", self.sess.graph)
+
+        counter = 1
+        start_time = time.time()
+
+        if self.load(args.checkpoint_dir):
+            print(" [*] Load SUCCESS")
+        else:
+            print(" [!] Load failed...")
+
+        for epoch in xrange(args.epoch):
+            #TODO
+            data = glob('./datasets/{}/*.jpg'.format(self.dataset_dir+'/trainA'))
+            np.random.shuffle(data)
+            batch_idxs = min(len(data), args.train_size) // self.batch_size
+
+            for idx in xrange(0, batch_idxs):
+                batch_files  = dataA[idx*self.batch_size:(idx+1)*self.batch_size]
+                batch_images = [load_data(batch_file) for batch_file in batch_files]
+                batch_images = np.array(batch_images).astype(np.float32)
+                batch_z      = np.random.normal(loc=0.0, scale=1.0, size=(self.sample_size), self.z_dim)
+
+                # Forward G network
+                fake_A, fake_B = self.sess.run([self.fake_A, self.fake_B],
+                                               feed_dict={ self.real_data: batch_images,
+                                                           self.real_code: batch_z})
+                # Here instead of use the most recent images, 
+                # use the image pool to store the recent ones,
+                # and random pick out one.
+                [fake_A, fake_B] = self.pool([fake_A, fake_B])
+                # Update G_a2b network
+                _, summary_str = self.sess.run([self.g_a2b_optim, self.g_a2b_sum],
+                                               feed_dict={ self.real_data: batch_images,
+                                                           self.real_code: batch_z})
+                self.writer.add_summary(summary_str, counter)
+                # Update Db network
+                _, summary_str = self.sess.run([self.db_optim, self.db_sum],
+                                               feed_dict={ self.real_data: batch_images,
+                                                           self.fake_B_sample: fake_B })
+                self.writer.add_summary(summary_str, counter)
+                # Update G_b2a network
+                _, summary_str = self.sess.run([self.g_b2a_optim, self.g_b2a_sum],
+                                               feed_dict={ self.real_data: batch_images,
+                                                           self.real_code: batch_z})
+                self.writer.add_summary(summary_str, counter)
+                # Update Da network
+                _, summary_str = self.sess.run([self.da_optim, self.da_sum],
+                                               feed_dict={ self.real_data: batch_images,
+                                                           self.fake_A_sample: fake_A})
+                self.writer.add_summary(summary_str, counter)
+                # Update Dab network
+                _, summary_str = self.sess.run([self.dab_optim, self.dab_sum],
+                                               feed_dict={self.real_data: batch_images,
+                                                          self.fake_A_sample: fake_A,
+                                                          self.fake_B_sample: fake_B})
+                self.writer.add_summary(summary_str, counter)
+
+                counter += 1
+                print("Epoch: [%2d] [%4d/%4d] time: %4.4f" \
+                      % (epoch, idx, batch_idxs, time.time() - start_time))
+
+                if np.mod(counter, 100) == 1:
+                    self.sample_model(args.sample_dir, epoch, idx)
+
+                if np.mod(counter, 1000) == 2:
+                    self.save(args.checkpoint_dir, counter)
+
+    def save(self, checkpoint_dir, step):
+        model_name = "cyclegan.model"
+        model_dir = "%s_%s" % (self.dataset_dir, self.image_size)
+        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+
+        self.saver.save(self.sess,
+                        os.path.join(checkpoint_dir, model_name),
+                        global_step=step)
+
+    def load(self, checkpoint_dir):
+        print(" [*] Reading checkpoint...")
+
+        model_dir = "%s_%s" % (self.dataset_dir, self.image_size)
+        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+
+        ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+        if ckpt and ckpt.model_checkpoint_path:
+            ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+            self.saver.restore(self.sess, os.path.join(checkpoint_dir, ckpt_name))
+            return True
+        else:
+            return False
+
+    def sample_model(self, sample_dir, epoch, idx):
+        dataA = glob('./datasets/{}/*.jpg'.format(self.dataset_dir+'/testA'))
+        dataB = glob('./datasets/{}/*.jpg'.format(self.dataset_dir+'/testB'))
+        np.random.shuffle(dataA)
+        np.random.shuffle(dataB)
+        batch_files = zip(dataA[:self.batch_size], dataB[:self.batch_size])
+        sample_images = [load_data(batch_file, False, True) for batch_file in batch_files]
+        sample_images = np.array(sample_images).astype(np.float32)
+
+        fake_A, fake_B = self.sess.run(
+            [self.fake_A, self.fake_B],
+            feed_dict={self.real_data: sample_images}
+        )
+        save_images(fake_A, [self.batch_size, 1],
+                    './{}/A_{:02d}_{:04d}.jpg'.format(sample_dir, epoch, idx))
+        save_images(fake_B, [self.batch_size, 1],
+                    './{}/B_{:02d}_{:04d}.jpg'.format(sample_dir, epoch, idx))
+
+    def test(self, args):
+        """Test cyclegan"""
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
+        if args.which_direction == 'AtoB':
+            sample_files = glob('./datasets/{}/*.jpg'.format(self.dataset_dir+'/testA'))
+        elif args.which_direction == 'BtoA':
+            sample_files = glob('./datasets/{}/*.jpg'.format(self.dataset_dir+'/testB'))
+        else:
+            raise Exception, '--which_direction must be AtoB or BtoA'
+
+        if self.load(args.checkpoint_dir):
+            print(" [*] Load SUCCESS")
+        else:
+            print(" [!] Load failed...")
+
+        for sample_file in sample_files:
+            print 'Processing image: '+sample_file
+            sample_image = [load_test_data(sample_file)]
+            sample_image = np.array(sample_image).astype(np.float32)
+            if args.which_direction == 'AtoB':
+                fake_B = self.sess.run(self.testB, feed_dict={self.test_A: sample_image})
+                save_images(fake_B, [1, 1], '{}/A2B_{}' \
+                            .format(args.test_dir, sample_file.split('/')[-1]))
+            else:
+                fake_A = self.sess.run(self.testA, feed_dict={self.test_B: sample_image})
+                save_images(fake_A, [1, 1], '{}/B2A_{}' \
+                            .format(args.test_dir, sample_file.split('/')[-1]))
