@@ -34,8 +34,11 @@ def discB(code, options, reuse=False, name="discB"):
         else:
             assert tf.get_variable_scope().reuse == False
 
-        fc1 = dense(code, 1024, name='fc1')
-        fc2 = dense(fc1, 512, name='fc2')        
+        fc1 = dense(code, options.df_dim*16, name='fc1')
+        # fc1 is (df_dim*8)
+        fc2 = dense(fc1,  options.df_dim*8, name='fc2')        
+        # fc2 is (df_dim*8)
+
         return fc2
 
 def discAB(image, code, options, reuse=False, name="discriminatorAB"):
@@ -58,15 +61,16 @@ def discAB(image, code, options, reuse=False, name="discriminatorAB"):
         # h3 is (32 x 32 x self.df_dim*8)
         m1_h4 = conv2d(m1_h3, 1, s=1, name='m1_h4')
         # h4 is (32 x 32 x 1)
-        m1_h5 = dense(flatten(m1_h4, name='m1_flatten'), 512, name='m1_h5')
-        # h5 is (512 x 1)
+        m1_h5 = dense(flatten(m1_h4, name='m1_flatten'), options.df_dim*8, name='m1_h5')
+        # h5 is (512)
 
-        m2_fc1 = dense(code, 1024, name='m2_fc1')
-        m2_fc2 = dense(fc1, 512, name='m2_fc2')
+        m2_fc1 = dense(code, options.df_dim*16, name='m2_fc1')
+        m2_fc2 = dense(m2_fc1,  options.df_dim*8,  name='m2_fc2')
         
-        m_h0  = tf.concat([m1_h5, m2_fc2], 0)
-        m_h1  = dense(m_h0, 1024, name='m_h1')
-        m_out = dense(m_h1, 1024, name='m_h2')
+        print (tf.shape(m2_fc2))
+        m_h0  = tf.concat([m1_h5, m2_fc2], 1)
+        m_h1  = dense(m_h0, options.df_dim*16, name='m_h1')
+        m_out = dense(m_h1, options.df_dim*16, name='m_h2')
 
         return m_out
 
@@ -82,55 +86,61 @@ def encoder_unet(image, options, reuse=False, name='encoder'):
         # image is (256 x 256 x input_c_dim)
         e1 = conv2d(image, options.gf_dim, name='e1_conv')
         # e1 is (128 x 128 x self.gf_dim)
-        e2 = instance_norm(conv2d(lrelu(e1), options.gf_dim*2, name='e2_conv'), 'e2_bn')
+        e2 = instance_norm(conv2d(lrelu(e1), options.gf_dim*2,  name='e2_conv'), 'e2_bn')
         # e2 is (64 x 64 x self.gf_dim*2)
-        e3 = instance_norm(conv2d(lrelu(e2), options.gf_dim*4, name='e3_conv'), 'e3_bn')
+        e3 = instance_norm(conv2d(lrelu(e2), options.gf_dim*4,  name='e3_conv'), 'e3_bn')
         # e3 is (32 x 32 x self.gf_dim*4)
-        e4 = instance_norm(conv2d(lrelu(e3), options.gf_dim*8, name='e4_conv'), 'e4_bn')
+        e4 = instance_norm(conv2d(lrelu(e3), options.gf_dim*8,  name='e4_conv'), 'e4_bn')
         # e4 is (16 x 16 x self.gf_dim*8)
-        e5 = instance_norm(conv2d(lrelu(e4), options.gf_dim*8, name='e5_conv'), 'e5_bn')
+        e5 = instance_norm(conv2d(lrelu(e4), options.gf_dim*8,  name='e5_conv'), 'e5_bn')
         # e5 is (8 x 8 x self.gf_dim*8)
-        e6 = instance_norm(conv2d(lrelu(e5), options.gf_dim*8, name='e6_conv'), 'e6_bn')
+        e6 = instance_norm(conv2d(lrelu(e5), options.gf_dim*8,  name='e6_conv'), 'e6_bn')
         # e6 is (4 x 4 x self.gf_dim*8)
-        e7 = instance_norm(conv2d(lrelu(e6), options.gf_dim*8, name='e7_conv'), 'e7_bn')
+        e7 = instance_norm(conv2d(lrelu(e6), options.gf_dim*8,  name='e7_conv'), 'e7_bn')
         # e7 is (2 x 2 x self.gf_dim*8)
-        e8 = instance_norm(conv2d(lrelu(e7), options.gf_dim*8, name='e8_conv'), 'e8_bn')
-        # e8 is (1 x 1 x self.gf_dim*8)
-        # out = dense(flatten(e8, name='e8_flatten'), 512, name='e8_dense')
+        e8 = instance_norm(conv2d(lrelu(e7), options.gf_dim*16, name='e8_conv'), 'e8_bn')
+        # e8 is (1 x 1 x self.gf_dim*16)
 
-        return tf.nn.relu(e8)
+        return tf.nn.relu(flatten(e8, name='e8_flatten'))
 
 def decoder_unet(code, options, reuse=False, name='decoder'):
 
     with tf.variable_scope(name):
         # code is 512
-        d1 = deconv2d(code, options.gf_dim*8, name='g_d1')
-        d1 = tf.concat([tf.nn.dropout(instance_norm(d1, 'g_bn_d1'), 0.5), e7], 3)
-        # d1 is (2 x 2 x self.gf_dim*8*2)
+        if reuse:
+            tf.get_variable_scope().reuse_variables()
+        else:
+            assert tf.get_variable_scope().reuse == False
+
+        d0 = tf.reshape(code, [-1, 1, 1, 512])
+
+        d1 = deconv2d(d0, options.gf_dim*8, name='g_d1')
+        d1 = tf.nn.dropout(instance_norm(d1, 'g_bn_d1'), 0.5)
+        # d1 is (2 x 2 x self.gf_dim*8)
 
         d2 = deconv2d(tf.nn.relu(d1), options.gf_dim*8, name='g_d2')
-        d2 = tf.concat([tf.nn.dropout(instance_norm(d2, 'g_bn_d2'), 0.5), e6], 3)
-        # d2 is (4 x 4 x self.gf_dim*8*2)
+        d2 = tf.nn.dropout(instance_norm(d2, 'g_bn_d2'), 0.5)
+        # d2 is (4 x 4 x self.gf_dim*8)
 
         d3 = deconv2d(tf.nn.relu(d2), options.gf_dim*8, name='g_d3')
-        d3 = tf.concat([tf.nn.dropout(instance_norm(d3, 'g_bn_d3'), 0.5), e5], 3)
-        # d3 is (8 x 8 x self.gf_dim*8*2)
+        d3 = tf.nn.dropout(instance_norm(d3, 'g_bn_d3'), 0.5)
+        # d3 is (8 x 8 x self.gf_dim*8)
 
         d4 = deconv2d(tf.nn.relu(d3), options.gf_dim*8, name='g_d4')
-        d4 = tf.concat([instance_norm(d4, 'g_bn_d4'), e4], 3)
-        # d4 is (16 x 16 x self.gf_dim*8*2)
+        d4 = tf.nn.dropout(instance_norm(d4, 'g_bn_d4'), 0.5)
+        # d4 is (16 x 16 x self.gf_dim*8)
 
         d5 = deconv2d(tf.nn.relu(d4), options.gf_dim*4, name='g_d5')
-        d5 = tf.concat([instance_norm(d5, 'g_bn_d5'), e3], 3)
-        # d5 is (32 x 32 x self.gf_dim*4*2)
+        d5 = tf.nn.dropout(instance_norm(d5, 'g_bn_d5'), 0.5)
+        # d5 is (32 x 32 x self.gf_dim*4)
 
         d6 = deconv2d(tf.nn.relu(d5), options.gf_dim*2, name='g_d6')
-        d6 = tf.concat([instance_norm(d6, 'g_bn_d6'), e2], 3)
-        # d6 is (64 x 64 x self.gf_dim*2*2)
+        d6 = instance_norm(d6, 'g_bn_d6')
+        # d6 is (64 x 64 x self.gf_dim*2)
 
         d7 = deconv2d(tf.nn.relu(d6), options.gf_dim, name='g_d7')
-        d7 = tf.concat([instance_norm(d7, 'g_bn_d7'), e1], 3)
-        # d7 is (128 x 128 x self.gf_dim*1*2)
+        d7 = instance_norm(d7, 'g_bn_d7')
+        # d7 is (128 x 128 x self.gf_dim*1)
 
         d8 = deconv2d(tf.nn.relu(d7), options.output_c_dim, name='g_d8')
         # d8 is (256 x 256 x output_c_dim)

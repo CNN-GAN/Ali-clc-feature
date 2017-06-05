@@ -3,18 +3,20 @@ import os
 import scipy.misc
 import numpy as np
 import tensorflow as tf
-from model import cyclegan
+from model import ali_cyclegan
 
 parser = argparse.ArgumentParser(description='')
-parser.add_argument('--dataset_dir', dest='dataset_dir', default='horse2zebra', help='path of the dataset')
+parser.add_argument('--dataset_dir', dest='dataset_dir', default='loam', help='path of the dataset')
 parser.add_argument('--epoch', dest='epoch', type=int, default=200, help='# of epoch')
 parser.add_argument('--batch_size', dest='batch_size', type=int, default=1, help='# images in batch')
+parser.add_argument('--code_size',  dest='code_size',  type=int, default=1, help='# codes in batch')
 parser.add_argument('--train_size', dest='train_size', type=int, default=1e8, help='# images used to train')
 parser.add_argument('--load_size', dest='load_size', type=int, default=286, help='scale images to this size')
 parser.add_argument('--fine_size', dest='fine_size', type=int, default=256, help='then crop to this size')
 parser.add_argument('--ngf', dest='ngf', type=int, default=32, help='# of gen filters in first conv layer')
 parser.add_argument('--ndf', dest='ndf', type=int, default=64, help='# of discri filters in first conv layer')
 parser.add_argument('--input_nc', dest='input_nc', type=int, default=3, help='# of input image channels')
+parser.add_argument('--input_nz', dest='input_nz', type=int, default=512, help='# of input code channels')
 parser.add_argument('--output_nc', dest='output_nc', type=int, default=3, help='# of output image channels')
 parser.add_argument('--niter', dest='niter', type=int, default=200, help='# of iter at starting learning rate')
 parser.add_argument('--lr', dest='lr', type=float, default=0.0002, help='initial learning rate for adam')
@@ -45,10 +47,13 @@ def main(_):
     if not os.path.exists(args.test_dir):
         os.makedirs(args.test_dir)
 
-    with tf.Session() as sess:
-        model = cyclegan(sess, args)
-        model.train(args) if args.phase == 'train' \
-            else model.test(args)
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.333)
+    config = tf.ConfigProto(gpu_options=gpu_options)
+    config.gpu_options.allow_growth=True
+        
+    with tf.Session(config=config) as sess:
+        model = ali_cyclegan(sess, args)
+        model.train(args) if args.phase == 'train' else model.test(args)
 
 if __name__ == '__main__':
     tf.app.run()

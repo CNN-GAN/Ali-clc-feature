@@ -44,39 +44,26 @@ def load_test_data(image_path, fine_size=256):
     return img
 
 def load_data(image_path, flip=True, is_test=False):
-    img_A, img_B = load_image(image_path)
-    img_A, img_B = preprocess_A_and_B(img_A, img_B, flip=flip, is_test=is_test)
+    img = load_image(image_path)
+    img = preprocess_img(img, flip=flip, is_test=is_test)
 
-    img_A = img_A/127.5 - 1.
-    img_B = img_B/127.5 - 1.
-
-    img_AB = np.concatenate((img_A, img_B), axis=2)
-    # img_AB shape: (fine_size, fine_size, input_c_dim + output_c_dim)
-    return img_AB
+    img = img/127.5 - 1.
+    return img
 
 def load_image(image_path):
-    img_A = imread(image_path[0])
-    img_B = imread(image_path[1])
-    return img_A, img_B
+    img = imread(image_path)
+    return img
 
-def preprocess_A_and_B(img_A, img_B, load_size=286, fine_size=256, flip=True, is_test=False):
+def preprocess_img(img, fine_size=256, flip=True, is_test=False):
     if is_test:
-        img_A = scipy.misc.imresize(img_A, [fine_size, fine_size])
-        img_B = scipy.misc.imresize(img_B, [fine_size, fine_size])
+        img = scipy.misc.imresize(img, [fine_size, fine_size])
     else:
-        img_A = scipy.misc.imresize(img_A, [load_size, load_size])
-        img_B = scipy.misc.imresize(img_B, [load_size, load_size])
-
-        h1 = int(np.ceil(np.random.uniform(1e-2, load_size-fine_size)))
-        w1 = int(np.ceil(np.random.uniform(1e-2, load_size-fine_size)))
-        img_A = img_A[h1:h1+fine_size, w1:w1+fine_size]
-        img_B = img_B[h1:h1+fine_size, w1:w1+fine_size]
+        img = scipy.misc.imresize(img, [fine_size, fine_size])
 
         if flip and np.random.random() > 0.5:
-            img_A = np.fliplr(img_A)
-            img_B = np.fliplr(img_B)
+            img = np.fliplr(img)
 
-    return img_A, img_B
+    return img
 
 # -----------------------------
 

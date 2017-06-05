@@ -32,7 +32,7 @@ def deconv2d(input_, output_dim, ks=4, s=2, stddev=0.02, name="deconv2d"):
                                      weights_initializer=tf.truncated_normal_initializer(stddev=stddev),
                                      biases_initializer=None)
 
-def dense(input_, output_dim, activation_fn=tf.nn.tanh, name="fully_connect"):
+def dense(input_, output_dim, activation=tf.nn.tanh, name="fully_connect"):
     with tf.variable_scope(name):
         return slim.fully_connected(input_, output_dim, activation_fn=activation,
                                     weights_initializer=tf.contrib.layers.xavier_initializer(),
